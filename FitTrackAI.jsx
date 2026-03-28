@@ -216,7 +216,9 @@ const MAX_TOKENS = {
 };
 
 // ─── API HELPER ───────────────────────────────────────────────────────────────
-async function callAgent(name, msg, systemPromptOverride, signal) {
+const delay = ms => new Promise(r => setTimeout(r, ms));
+
+async function callAgent(name, msg, systemPromptOverride, signal, _retries = 3) {
   const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
   if (!apiKey) throw new Error("Missing VITE_GEMINI_API_KEY — copy .env.example to .env and add your key.");
   const model = "gemini-2.5-flash";
@@ -231,6 +233,13 @@ async function callAgent(name, msg, systemPromptOverride, signal) {
     }),
     signal,
   });
+  if (res.status === 429 && _retries > 0) {
+    const waitMatch = (await res.text()).match(/(\d+\.?\d*)\s*s/);
+    const waitSec = waitMatch ? Math.ceil(parseFloat(waitMatch[1])) + 2 : 15;
+    console.warn(`[${name}] Rate limited — retrying in ${waitSec}s (${_retries} retries left)`);
+    await delay(waitSec * 1000);
+    return callAgent(name, msg, systemPromptOverride, signal, _retries - 1);
+  }
   if (!res.ok) { const e = await res.json(); throw new Error(e.error?.message||`API ${res.status}`); }
   const d = await res.json();
   const txt = (d.candidates?.[0]?.content?.parts||[]).map(p=>p.text||"").join("").trim();
@@ -1132,16 +1141,30 @@ export default function App() {
       const dietKey=`${prof.dietType}_${(prof.dietTags||[]).join("_")}_${profileResult.targetCalories}_${prof.goal}`;
       const costKey=`${prof.dietType}_${profileResult.targetCalories}_${prof.goal}`;
 
-      if(!(precomp.current.dietKey===dietKey&&precomp.current.diet)){
+      const needDiet = !(precomp.current.dietKey===dietKey&&precomp.current.diet);
+      const needCost = !(precomp.current.costKey===costKey&&precomp.current.cost);
+
+      if(needDiet){
         aborts.current.diet?.abort();
         const c1=new AbortController();
         aborts.current.diet=c1;
         precomp.current.dietKey=dietKey;
         callAgentWithAudit("DietPlanAgent",dm,undefined,c1.signal)
-          .then(r=>{if(!c1.signal.aborted){precomp.current.diet=r;setPrecompStatus(s=>({...s,DietPlanAgent:true}));}})
+          .then(async r=>{
+            if(!c1.signal.aborted){precomp.current.diet=r;setPrecompStatus(s=>({...s,DietPlanAgent:true}));}
+            if(needCost && !c1.signal.aborted){
+              await delay(13000);
+              aborts.current.cost?.abort();
+              const c2=new AbortController();
+              aborts.current.cost=c2;
+              precomp.current.costKey=costKey;
+              callAgentWithAudit("CostEstimatorAgent",cm,buildCostPrompt(prices),c2.signal)
+                .then(r2=>{if(!c2.signal.aborted){precomp.current.cost=r2;setPrecompStatus(s=>({...s,CostEstimatorAgent:true}));}})
+                .catch(()=>{});
+            }
+          })
           .catch(()=>{});
-      }
-      if(!(precomp.current.costKey===costKey&&precomp.current.cost)){
+      } else if(needCost){
         aborts.current.cost?.abort();
         const c2=new AbortController();
         aborts.current.cost=c2;
@@ -1183,27 +1206,31 @@ export default function App() {
       const workoutCached = !!(precomp.current.workoutKey===`${prof.workoutsPerWeek}_${prof.goal}`&&precomp.current.workout);
       const dietCached    = !!(precomp.current.dietKey===dietKey&&precomp.current.diet);
       const costCached    = !!(precomp.current.costKey===costKey&&precomp.current.cost);
-      // DietPlanAgent is the bottleneck (~90-120s). Workout/Cost are ~30-45s each.
-      const estimate = workoutCached && dietCached && costCached ? 5
-        : dietCached && workoutCached ? 45
-        : dietCached && costCached    ? 45
-        : dietCached                  ? 50
-        : 135;
+      // Sequential calls with 13s delays between each to respect free-tier rate limits
+      const uncachedCount = [!workoutCached, !dietCached, !costCached].filter(Boolean).length;
+      const estimate = uncachedCount === 0 ? 5
+        : uncachedCount === 1 ? 45
+        : uncachedCount === 2 ? 110
+        : 170;
       setGenEstimate(estimate);
-      setGenMsg("Running all agents in parallel...");
+      setGenMsg("Running WorkoutPlanAgent...");
 
-      // All 3 agents fire simultaneously — total time = slowest agent, not sum of all
-      const [wk, dt, cs] = await Promise.all([
-        (precomp.current.workoutKey===workoutKey&&precomp.current.workout)
-          ?Promise.resolve(precomp.current.workout)
-          :callAgentWithAudit("WorkoutPlanAgent",`${profileMsg}\nGoal:${prof.goal}, Workout days/week:${prof.workoutsPerWeek}`),
-        (precomp.current.dietKey===dietKey&&precomp.current.diet)
-          ?Promise.resolve(precomp.current.diet)
-          :callAgentWithAudit("DietPlanAgent",dm),
-        (precomp.current.costKey===costKey&&precomp.current.cost)
-          ?Promise.resolve(precomp.current.cost)
-          :callAgentWithAudit("CostEstimatorAgent",cm,buildCostPrompt(prices)),
-      ]);
+      // Run agents sequentially with delays to stay within free-tier rate limits (5 req/min)
+      const wk = (precomp.current.workoutKey===workoutKey&&precomp.current.workout)
+        ? precomp.current.workout
+        : await callAgentWithAudit("WorkoutPlanAgent",`${profileMsg}\nGoal:${prof.goal}, Workout days/week:${prof.workoutsPerWeek}`);
+
+      setGenMsg("Running DietPlanAgent...");
+      if(!(precomp.current.dietKey===dietKey&&precomp.current.diet)) await delay(13000);
+      const dt = (precomp.current.dietKey===dietKey&&precomp.current.diet)
+        ? precomp.current.diet
+        : await callAgentWithAudit("DietPlanAgent",dm);
+
+      setGenMsg("Running CostEstimatorAgent...");
+      if(!(precomp.current.costKey===costKey&&precomp.current.cost)) await delay(13000);
+      const cs = (precomp.current.costKey===costKey&&precomp.current.cost)
+        ? precomp.current.cost
+        : await callAgentWithAudit("CostEstimatorAgent",cm,buildCostPrompt(prices));
       setWork(wk); setDiet(dt); setCost(cs);
       setScreen("dash");
     }catch(e){
