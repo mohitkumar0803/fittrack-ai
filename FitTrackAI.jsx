@@ -1096,88 +1096,8 @@ export default function App() {
     `Name:${prof.name||"User"}, Age:${prof.age}, Gender:${prof.gender}, Weight:${prof.weight}kg, Height:${prof.height}cm, Workouts/week:${prof.workoutsPerWeek}, Goal:${prof.goal}`,
     [prof.name,prof.age,prof.gender,prof.weight,prof.height,prof.workoutsPerWeek,prof.goal]);
 
-  // ── Pre-compute WorkoutPlanAgent once workoutsPerWeek + goal are set ──
-  useEffect(()=>{
-    if(screen!=="onboard"||!prof.workoutsPerWeek||!prof.goal) return;
-    const key=`${prof.workoutsPerWeek}_${prof.goal}`;
-    if(precomp.current.workoutKey===key&&precomp.current.workout) return;
-
-    aborts.current.workout?.abort();
-    const ctrl=new AbortController();
-    aborts.current.workout=ctrl;
-    precomp.current.workout=null;
-    precomp.current.workoutKey="";
-
-    const wm=`${profileMsg}\nGoal:${prof.goal}, Workout days/week:${prof.workoutsPerWeek}`;
-    callAgentWithAudit("WorkoutPlanAgent",wm,undefined,ctrl.signal)
-      .then(r=>{
-        if(!ctrl.signal.aborted){
-          precomp.current.workout=r;
-          precomp.current.workoutKey=key;
-          setPrecompStatus(s=>({...s,WorkoutPlanAgent:true}));
-        }
-      }).catch(()=>{});
-    return ()=>ctrl.abort();
-  },[prof.workoutsPerWeek,prof.goal,screen,profileMsg]);
-
-  // ── Pre-compute Diet + Cost as soon as goal is selected (Step 4+) ──
-  useEffect(()=>{
-    if(screen!=="onboard"||step<4||!prof.goal) return;
-
-    const tryPrecomp=()=>{
-      const profileResult=calcProfile(prof);
-
-      const dietTypeObj=DIET_TYPES.find(d=>d.id===prof.dietType);
-      const tagLabels=(prof.dietTags||[]).map(id=>DIET_TAGS.find(t=>t.id===id)?.label).filter(Boolean);
-      const dm=[
-        profileMsg,
-        `STRICT DAILY TARGETS (every day must hit these exactly ±30kcal/±5g): Calories=${profileResult.targetCalories}kcal, Protein=${profileResult.protein_g}g, Carbs=${profileResult.carbs_g}g, Fat=${profileResult.fat_g}g`,
-        dietTypeObj?`Diet type (follow STRICTLY): ${dietTypeObj.label} — ${dietTypeObj.desc}`:`Diet type: balanced Indian diet`,
-        tagLabels.length>0?`Additional preferences (must follow): ${tagLabels.join(", ")}`:null,
-        prof.excludeFoods?.trim()?`Foods to NEVER include: ${prof.excludeFoods}`:null,
-        prof.customDietNote?.trim()?`Extra notes: ${prof.customDietNote}`:null,
-      ].filter(Boolean).join("\n");
-      const cm=`Goal:${prof.goal}, Target cal/day:${profileResult.targetCalories}, Diet type:${prof.dietType||"balanced"}, Main foods:mixed Indian diet dal rice roti chicken eggs vegetables`;
-      const dietKey=`${prof.dietType}_${(prof.dietTags||[]).join("_")}_${profileResult.targetCalories}_${prof.goal}`;
-      const costKey=`${prof.dietType}_${profileResult.targetCalories}_${prof.goal}`;
-
-      const needDiet = !(precomp.current.dietKey===dietKey&&precomp.current.diet);
-      const needCost = !(precomp.current.costKey===costKey&&precomp.current.cost);
-
-      if(needDiet){
-        aborts.current.diet?.abort();
-        const c1=new AbortController();
-        aborts.current.diet=c1;
-        precomp.current.dietKey=dietKey;
-        callAgentWithAudit("DietPlanAgent",dm,undefined,c1.signal)
-          .then(async r=>{
-            if(!c1.signal.aborted){precomp.current.diet=r;setPrecompStatus(s=>({...s,DietPlanAgent:true}));}
-            if(needCost && !c1.signal.aborted){
-              await delay(13000);
-              aborts.current.cost?.abort();
-              const c2=new AbortController();
-              aborts.current.cost=c2;
-              precomp.current.costKey=costKey;
-              callAgentWithAudit("CostEstimatorAgent",cm,buildCostPrompt(prices),c2.signal)
-                .then(r2=>{if(!c2.signal.aborted){precomp.current.cost=r2;setPrecompStatus(s=>({...s,CostEstimatorAgent:true}));}})
-                .catch(()=>{});
-            }
-          })
-          .catch(()=>{});
-      } else if(needCost){
-        aborts.current.cost?.abort();
-        const c2=new AbortController();
-        aborts.current.cost=c2;
-        precomp.current.costKey=costKey;
-        callAgentWithAudit("CostEstimatorAgent",cm,buildCostPrompt(prices),c2.signal)
-          .then(r=>{if(!c2.signal.aborted){precomp.current.cost=r;setPrecompStatus(s=>({...s,CostEstimatorAgent:true}));}})
-          .catch(()=>{});
-      }
-      return true;
-    };
-
-    tryPrecomp();
-  },[step,screen,prof.dietType,prof.dietTags,prof.goal,prof.excludeFoods,prof.customDietNote,prices,profileMsg,prof.age,prof.gender,prof.weight,prof.height,prof.workoutsPerWeek]);
+  // ── Pre-compute disabled to respect free-tier rate limits ──
+  // All API calls happen sequentially in generate() when user clicks "Generate"
 
   // ── Generate (all agents in parallel, uses cache when available) ──
   const generate = useCallback(async()=>{
@@ -1203,34 +1123,23 @@ export default function App() {
       const dietKey  = `${prof.dietType}_${(prof.dietTags||[]).join("_")}_${c.targetCalories}_${prof.goal}`;
       const costKey  = `${prof.dietType}_${c.targetCalories}_${prof.goal}`;
 
-      const workoutCached = !!(precomp.current.workoutKey===`${prof.workoutsPerWeek}_${prof.goal}`&&precomp.current.workout);
-      const dietCached    = !!(precomp.current.dietKey===dietKey&&precomp.current.diet);
-      const costCached    = !!(precomp.current.costKey===costKey&&precomp.current.cost);
-      // Sequential calls with 13s delays between each to respect free-tier rate limits
-      const uncachedCount = [!workoutCached, !dietCached, !costCached].filter(Boolean).length;
-      const estimate = uncachedCount === 0 ? 5
-        : uncachedCount === 1 ? 45
-        : uncachedCount === 2 ? 110
-        : 170;
-      setGenEstimate(estimate);
+      // Sequential calls with delays to stay within free-tier rate limits (5 req/min)
+      setGenEstimate(180);
       setGenMsg("Running WorkoutPlanAgent...");
 
-      // Run agents sequentially with delays to stay within free-tier rate limits (5 req/min)
-      const wk = (precomp.current.workoutKey===workoutKey&&precomp.current.workout)
-        ? precomp.current.workout
-        : await callAgentWithAudit("WorkoutPlanAgent",`${profileMsg}\nGoal:${prof.goal}, Workout days/week:${prof.workoutsPerWeek}`);
+      const wk = await callAgentWithAudit("WorkoutPlanAgent",`${profileMsg}\nGoal:${prof.goal}, Workout days/week:${prof.workoutsPerWeek}`);
+
+      setGenMsg("Waiting for rate limit cooldown...");
+      await delay(15000);
 
       setGenMsg("Running DietPlanAgent...");
-      if(!(precomp.current.dietKey===dietKey&&precomp.current.diet)) await delay(13000);
-      const dt = (precomp.current.dietKey===dietKey&&precomp.current.diet)
-        ? precomp.current.diet
-        : await callAgentWithAudit("DietPlanAgent",dm);
+      const dt = await callAgentWithAudit("DietPlanAgent",dm);
+
+      setGenMsg("Waiting for rate limit cooldown...");
+      await delay(15000);
 
       setGenMsg("Running CostEstimatorAgent...");
-      if(!(precomp.current.costKey===costKey&&precomp.current.cost)) await delay(13000);
-      const cs = (precomp.current.costKey===costKey&&precomp.current.cost)
-        ? precomp.current.cost
-        : await callAgentWithAudit("CostEstimatorAgent",cm,buildCostPrompt(prices));
+      const cs = await callAgentWithAudit("CostEstimatorAgent",cm,buildCostPrompt(prices));
       setWork(wk); setDiet(dt); setCost(cs);
       setScreen("dash");
     }catch(e){
