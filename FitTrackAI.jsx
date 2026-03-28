@@ -221,7 +221,7 @@ const delay = ms => new Promise(r => setTimeout(r, ms));
 async function callAgent(name, msg, systemPromptOverride, signal, _retries = 3) {
   const apiKey = import.meta.env.VITE_GEMINI_API_KEY;
   if (!apiKey) throw new Error("Missing VITE_GEMINI_API_KEY — copy .env.example to .env and add your key.");
-  const model = "gemini-2.5-flash";
+  const model = "gemini-2.0-flash";
   const url = `https://generativelanguage.googleapis.com/v1beta/models/${model}:generateContent?key=${apiKey}`;
   const res = await fetch(url, {
     method:"POST",
@@ -1124,19 +1124,19 @@ export default function App() {
       const costKey  = `${prof.dietType}_${c.targetCalories}_${prof.goal}`;
 
       // Sequential calls with delays to stay within free-tier rate limits (5 req/min)
-      setGenEstimate(180);
+      setGenEstimate(120);
       setGenMsg("Running WorkoutPlanAgent...");
 
       const wk = await callAgentWithAudit("WorkoutPlanAgent",`${profileMsg}\nGoal:${prof.goal}, Workout days/week:${prof.workoutsPerWeek}`);
 
-      setGenMsg("Waiting for rate limit cooldown...");
-      await delay(15000);
+      setGenMsg("Preparing next agent...");
+      await delay(5000);
 
       setGenMsg("Running DietPlanAgent...");
       const dt = await callAgentWithAudit("DietPlanAgent",dm);
 
-      setGenMsg("Waiting for rate limit cooldown...");
-      await delay(15000);
+      setGenMsg("Preparing next agent...");
+      await delay(5000);
 
       setGenMsg("Running CostEstimatorAgent...");
       const cs = await callAgentWithAudit("CostEstimatorAgent",cm,buildCostPrompt(prices));
